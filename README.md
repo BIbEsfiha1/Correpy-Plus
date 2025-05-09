@@ -120,9 +120,6 @@ Contribuições são bem-vindas! Sinta-se à vontade para abrir issues e pull re
 4. Push para a branch (`git push origin feature/AmazingFeature`)
 5. Abra um Pull Request
 
-## 📝 Licença
-
-Este projeto está licenciado sob a Licença MIT - veja o arquivo [LICENSE](LICENSE) para detalhes.
 
 ## 🙏 Agradecimentos
 
