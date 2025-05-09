@@ -50,7 +50,7 @@ pip install correpy
 1. Clone este repositório:
 
 ```bash
-git clone https://github.com/seu-usuario/correpy-plus.git
+git clone https://github.com/BIbEsfiha1/correpy-plus.git
 cd correpy-plus
 ```
 
