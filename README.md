@@ -15,18 +15,20 @@ Baseada na biblioteca [correpy](https://github.com/thiagosalvatore/correpy), o C
 
 - **Interface Gráfica Amigável**: Interface moderna e intuitiva que facilita o processamento dos PDFs
 - **Exportação Automática**: Gera Excel automaticamente no mesmo local do arquivo PDF original
-- **Suporte a Mercado Futuro**: Extração completa de informações específicas:
+- **Detecção Avançada de Contratos Futuros**: 
+  - Suporte para múltiplos formatos de contratos (WDO, WIN, DOL, IND, etc.)
+  - Reconhecimento automático de códigos de vencimento (F=Jan, G=Fev, etc.)
+  - Detecção de até 17 tipos diferentes de contratos futuros
+  - Sistema anti-duplicação inteligente em múltiplos níveis
+- **Extração Completa de Dados**: Captura de informações específicas:
   - C/V (tipo da operação)
-  - Mercadoria (ex: WINJ25)
-  - Vencimento (ex: 16/04/2025)
-  - Quantidade
-  - Preço/Ajuste
-  - Tipo Negócio (DAY TRADE, NORMAL)
-  - Valor Operação/D/C
-  - Taxa Operacional
+  - Mercadoria com vencimento (ex: WDO F25 (Janeiro/25))
+  - Quantidade, preço e valor total
+  - Tipo de mercado (Vista, Futuro, Opções)
+  - Código e mês de vencimento detalhados
 - **Formatação Adequada**: Valores monetários formatados corretamente (R$ #.##0,00)
 - **Multi-Processamento**: Processa vários PDFs simultaneamente
-- **Sistema de Fallback**: Usa múltiplos extratores em cascata para garantir que os dados sejam extraídos
+- **Sistema de Fallback**: Usa múltiplos extratores em cascata para garantir que os dados sejam extraídos mesmo em PDFs complexos
 
 ## 📦 Instalação
 
@@ -50,7 +52,7 @@ pip install correpy
 1. Clone este repositório:
 
 ```bash
-git clone https://github.com/BIbEsfiha1/correpy-plus.git
+git clone https://github.com/seu-usuario/correpy-plus.git
 cd correpy-plus
 ```
 
@@ -82,19 +84,35 @@ python main.py
 
 ## 📊 Estrutura do Excel Gerado
 
-O Excel gerado contém as seguintes informações para operações no mercado futuro:
+O Excel gerado é organizado por mês, com abas separadas para facilitar a análise. Os dados incluem:
+
+### Para Mercado à Vista (Bovespa)
 
 | Campo | Descrição |
 |-------|-----------|
-| C/V | Compra (C) ou Venda (V) |
-| Mercadoria | Ticker do contrato (ex: WINJ25) |
-| Vencimento | Data de vencimento do contrato |
+| Data | Data da operação |
+| Número da Nota | Identificador da nota de corretagem |
+| Tipo de Transação | COMPRA ou VENDA |
+| Quantidade | Quantidade de ações/contratos |
+| Preço Unitário | Valor unitário da ação/contrato |
+| Valor | Valor total da operação |
+| Ativo | Código do ativo negociado |
+| Taxa de Liquidação, Registro, etc. | Taxas associadas à operação |
+
+### Para Mercado Futuro (BMF)
+
+| Campo | Descrição |
+|-------|-----------|
+| Data | Data da operação |
+| Número da Nota | Identificador da nota de corretagem |
+| Tipo de Transação | COMPRA ou VENDA |
 | Quantidade | Número de contratos |
-| Preço / Ajuste | Valor do contrato |
-| Tipo Negócio | DAY TRADE ou NORMAL |
-| Valor Operação / D/C | Valor da operação (Débito/Crédito) |
-| D/C | Débito (D) ou Crédito (C) |
-| Taxa Operacional | Valor da taxa operacional |
+| Preço Unitário | Valor do contrato |
+| Valor | Valor total da operação |
+| Ativo | Ticker completo com info de vencimento (ex: WDO F25 (Janeiro/25)) |
+| Tipo de Mercado | Futuro |
+| Código de Vencimento | Código de vencimento (ex: F25, G25) |
+| Mês de Vencimento | Nome do mês de vencimento (ex: Janeiro, Fevereiro) |
 
 ## 🧩 Arquitetura
 
@@ -120,6 +138,9 @@ Contribuições são bem-vindas! Sinta-se à vontade para abrir issues e pull re
 4. Push para a branch (`git push origin feature/AmazingFeature`)
 5. Abra um Pull Request
 
+## 📝 Licença
+
+Este projeto está licenciado sob a Licença MIT - veja o arquivo [LICENSE](LICENSE) para detalhes.
 
 ## 🙏 Agradecimentos
 

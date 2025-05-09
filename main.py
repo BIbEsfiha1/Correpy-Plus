@@ -12,12 +12,146 @@ import traceback
 import warnings
 import logging
 from correpy.parsers.brokerage_notes.parser_factory import ParserFactory
+import re
+import os
+import pdfplumber
+
+# Importar o módulo de extração de futuros
+from extrair_futuros_direto import main as extrair_futuros_main, extrair_contratos_futuros, extrair_texto_pdf
 
 # Configurar para ignorar avisos específicos (como CropBox missing)
 warnings.filterwarnings("ignore")
 
 # Suprimir mensagens de log do pdfplumber
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
+
+# Funções para extração de contratos futuros diretamente no main.py
+def parse_valor(valor_str):
+    """Converte string de valor para float"""
+    if not valor_str:
+        return 0
+    
+    # Remover caracteres não numéricos, exceto ponto e vírgula
+    valor_limpo = re.sub(r'[^\d.,]', '', str(valor_str))
+    
+    # Se estiver vazio após limpeza
+    if not valor_limpo:
+        return 0
+    
+    # Remover pontos de milhar e substituir vírgula por ponto
+    valor_limpo = valor_limpo.replace('.', '').replace(',', '.')
+    
+    try:
+        return float(valor_limpo)
+    except ValueError:
+        return 0
+
+def extrair_texto_pdf(caminho_pdf):
+    """Extrai todo o texto de um arquivo PDF"""
+    texto_completo = ""
+    try:
+        with pdfplumber.open(caminho_pdf) as pdf:
+            for pagina in pdf.pages:
+                texto = pagina.extract_text() or ""
+                texto_completo += texto + "\n"
+        return texto_completo
+    except Exception as e:
+        print(f"Erro ao extrair texto do PDF: {e}")
+        return ""
+
+def extrair_contratos_futuros(texto):
+    """Extrai contratos futuros do texto"""
+    transacoes = []
+    
+    # Verificar cada linha do texto
+    for linha in texto.split('\n'):
+        # Verificar padrões específicos para contratos futuros
+        # Padrão: C WDO F25 02/01/2025 1 6.088,0000 DAY TRADE
+        match = re.search(r'([CV])\s+([A-Z]{3})\s+([A-Z]\d{2}).*?(\d+)\s+([\d.,]+)', linha, re.IGNORECASE)
+        if match:
+            grupos = match.groups()
+            tipo = grupos[0].upper()
+            ativo_base = grupos[1].upper()
+            vencimento = grupos[2].upper()
+            quantidade = parse_valor(grupos[3])
+            preco = parse_valor(grupos[4])
+            valor_total = quantidade * preco
+            
+            # Criar transação
+            transacao = {
+                "tipo": tipo,
+                "ativo": f"{ativo_base} {vencimento}",
+                "quantidade": quantidade,
+                "preco": preco,
+                "valor_total": valor_total
+            }
+            transacoes.append(transacao)
+            continue
+        
+        # Padrão genérico: buscar por WIN, WDO, DOL, IND seguidos de números
+        for ativo in ["WIN", "WDO", "DOL", "IND"]:
+            if ativo in linha.upper():
+                match = re.search(r'([CV])\s+.*?(\d+).*?([\d.,]+)', linha, re.IGNORECASE)
+                if match:
+                    grupos = match.groups()
+                    tipo = grupos[0].upper()
+                    quantidade = parse_valor(grupos[1])
+                    preco = parse_valor(grupos[2])
+                    valor_total = quantidade * preco
+                    
+                    # Extrair vencimento (código como F25, G25, etc)
+                    vencimento = ""
+                    for termo in linha.split():
+                        if re.match(r'[A-Z]\d{2}', termo, re.IGNORECASE):
+                            vencimento = termo.upper()
+                            break
+                    
+                    # Criar transação
+                    transacao = {
+                        "tipo": tipo,
+                        "ativo": f"{ativo} {vencimento}" if vencimento else ativo,
+                        "quantidade": quantidade,
+                        "preco": preco,
+                        "valor_total": valor_total
+                    }
+                    
+                    # Verificar se não é duplicata
+                    duplicata = False
+                    for t in transacoes:
+                        if (t["ativo"] == transacao["ativo"] and 
+                            t["quantidade"] == transacao["quantidade"] and 
+                            t["preco"] == transacao["preco"] and
+                            t["tipo"] == transacao["tipo"]):
+                            duplicata = True
+                            break
+                    
+                    if not duplicata:
+                        transacoes.append(transacao)
+                    
+                    break
+    
+    return transacoes
+
+def detectar_contratos_futuros(caminho_pdf, logger=None):
+    """Função principal para detectar contratos futuros em um PDF"""
+    try:
+        texto = extrair_texto_pdf(caminho_pdf)
+        transacoes = extrair_contratos_futuros(texto)
+        
+        if logger:
+            logger.log(f"Encontradas {len(transacoes)} transações de contratos futuros", "sucesso")
+        else:
+            print(f"\nEncontradas {len(transacoes)} transações de contratos futuros:")
+            for i, t in enumerate(transacoes, 1):
+                print(f"  {i}. {t['tipo']} {t['ativo']} - {t['quantidade']} x {t['preco']} = {t['valor_total']:.2f}")
+        
+        return transacoes
+    except Exception as e:
+        if logger:
+            logger.log(f"Erro ao detectar contratos futuros: {str(e)}", "erro")
+        else:
+            print(f"Erro ao detectar contratos futuros: {e}")
+        return []
 
 # Importar analisadores de PDF personalizados (do menos para o mais avançado)
 try:
@@ -134,13 +268,171 @@ def processar_arquivo_pdf(caminho_pdf, dados_por_mes, logger):
                 logger.log(f"     - Corretora: {nota.brokerage_firm if hasattr(nota, 'brokerage_firm') else 'N/A'}")
                 logger.log(f"     - Total de transações: {len(nota.transactions)}")
                 
-                # Se não há transações, vamos tentar extrair informações básicas da nota mesmo assim
+                # Se não há transações, vamos tentar extrair contratos futuros desta nota
                 if len(nota.transactions) == 0:
+                    # Tentativa de extração de contratos futuros para cada nota individual
+                    logger.log(f"     - Tentando extrair contratos futuros nesta nota...", "alerta")
+                    
+                    try:
+                        # Extrair texto do PDF para esta nota
+                        texto_pdf = extrair_texto_pdf(caminho_pdf)
+                        
+                        # Usar a função aprimorada de detecção de contratos futuros
+                        contratos_encontrados = extrair_contratos_futuros(texto_pdf)
+                        
+                        if contratos_encontrados and len(contratos_encontrados) > 0:
+                            logger.log(f"     - Sucesso! Encontrados {len(contratos_encontrados)} contratos futuros!", "sucesso")
+                            
+                            # Mostrar detalhes dos contratos encontrados
+                            for i, contrato in enumerate(contratos_encontrados[:5], 1):
+                                mes_info = f" ({contrato.get('mes_vencimento', '')})" if contrato.get('mes_vencimento') else ""
+                                logger.log(f"       → Contrato #{i}: {contrato['tipo']} {contrato['ativo']}{mes_info} - {contrato['quantidade']} x {contrato['preco']}", "info")
+                            
+                            if len(contratos_encontrados) > 5:
+                                logger.log(f"       → ... e mais {len(contratos_encontrados) - 5} contratos", "info")
+                            
+                            # Verificar se já existem transações semelhantes antes de adicionar
+                            # Lista para manter registro das transações já existentes
+                            transacoes_existentes = []
+                            for t in nota.transactions:
+                                # Extrair informações da transação existente
+                                chave_transacao = (t.get('asset', ''), 
+                                                   t.get('quantity', 0), 
+                                                   t.get('price', 0), 
+                                                   t.get('operation', ''))
+                                transacoes_existentes.append(chave_transacao)
+                                
+                            # Contador de novas transações adicionadas
+                            novas_transacoes = 0
+                            
+                            # Adicionar os contratos encontrados como transações, evitando duplicatas
+                            for contrato in contratos_encontrados:
+                                # Determinar a operação
+                                operacao = 'buy' if contrato['tipo'] == 'C' else 'sell'
+                                
+                                # Verificar se já existe uma transação idêntica
+                                chave_nova = (contrato['ativo'], 
+                                             contrato['quantidade'], 
+                                             contrato['preco'], 
+                                             operacao)
+                                
+                                # Só adiciona se não for duplicata
+                                if chave_nova not in transacoes_existentes:
+                                    # Converter para o formato de transação do correpy
+                                    transaction = {
+                                        'asset': contrato['ativo'],
+                                        'quantity': contrato['quantidade'],
+                                        'price': contrato['preco'],
+                                        'operation': operacao,
+                                        # Adicionar informações extras
+                                        'market_type': 'future',
+                                        'expiration': contrato.get('vencimento', ''),
+                                        'expiration_month': contrato.get('mes_vencimento', '')
+                                    }
+                                    nota.transactions.append(transaction)
+                                    transacoes_existentes.append(chave_nova)
+                                    novas_transacoes += 1
+                            
+                            # Atualizar o log com as novas informações
+                            logger.log(f"     - Total de transações agora: {len(nota.transactions)}", "sucesso")
+                            logger.log(f"     - Novas transações adicionadas: {novas_transacoes}", "info")
+                            
+                            # Agora processar os contratos futuros encontrados
+                            data_referencia = nota.reference_date
+                            mes_ano = data_referencia.strftime('%Y_%m')
+                            
+                            # Garantir que o mês existe no dicionário
+                            if mes_ano not in dados_por_mes:
+                                dados_por_mes[mes_ano] = []
+                            
+                            # Verificar transacoes já existentes no Excel para evitar duplicatas
+                            registros_existentes = []
+                            for reg in dados_por_mes[mes_ano]:
+                                # Criar uma chave única para cada registro já existente
+                                try:
+                                    data = reg.get('Data')
+                                    if isinstance(data, datetime):
+                                        data_str = data.strftime('%Y-%m-%d')
+                                    else:
+                                        data_str = str(data)
+                                        
+                                    chave_excel = (data_str,
+                                               str(reg.get('Número da Nota', '')),
+                                               str(reg.get('Tipo de Transação', '')),
+                                               str(reg.get('Quantidade', 0)),
+                                               str(reg.get('Preço Unitário', 0)),
+                                               str(reg.get('Ativo', '')))
+                                    registros_existentes.append(chave_excel)
+                                except Exception as e:
+                                    # Ignorar erros na criação de chaves
+                                    pass
+                            
+                            # Contador de registros adicionados ao Excel
+                            novos_registros = 0
+                                
+                            # Adicionar cada contrato ao relatório, evitando duplicatas
+                            for contrato in contratos_encontrados:
+                                # Determinar o tipo de operação (formatado para exibição)
+                                if contrato['tipo'] == 'C':
+                                    tipo_operacao = 'COMPRA'
+                                elif contrato['tipo'] == 'V':
+                                    tipo_operacao = 'VENDA'
+                                else:
+                                    tipo_operacao = contrato['tipo']
+                                
+                                # Formatar o nome do ativo com informações adicionais
+                                ativo_info = contrato['ativo']
+                                if contrato.get('mes_vencimento') and contrato.get('vencimento') and len(contrato.get('vencimento')) > 1:
+                                    ativo_info = f"{ativo_info} ({contrato['mes_vencimento']}/{contrato['vencimento'][1:]})"
+                                
+                                # Criar chave para verificar duplicidade
+                                data_str = data_referencia.strftime('%Y-%m-%d')
+                                chave_novo_registro = (data_str,
+                                                     str(nota.reference_id),
+                                                     tipo_operacao,
+                                                     str(contrato['quantidade']),
+                                                     str(contrato['preco']),
+                                                     ativo_info)
+                                
+                                # Só adiciona se não for duplicata
+                                if chave_novo_registro not in registros_existentes:
+                                    registro = {
+                                        'Data': data_referencia,
+                                        'Número da Nota': nota.reference_id,
+                                        'Tipo de Transação': tipo_operacao,
+                                        'Quantidade': contrato['quantidade'],
+                                        'Preço Unitário': contrato['preco'],
+                                        'Valor': contrato['valor_total'],
+                                        'Ativo': ativo_info,
+                                        'Tipo de Mercado': 'Futuro',
+                                        'Código de Vencimento': contrato.get('vencimento', ''),
+                                        'Mês de Vencimento': contrato.get('mes_vencimento', '')
+                                    }
+                                    
+                                    # Adicionar campos padrão para relatório
+                                    for campo in ['Taxa de Liquidação', 'Taxa de Registro', 'Taxa de Termo/Opções',
+                                                'Taxa A.N.A', 'Emolumentos', 'Taxa Operacional', 'Execução',
+                                                'Corretagem', 'ISS', 'IRRF Retido na Fonte', 'Taxa de Custódia', 'Impostos']:
+                                        registro[campo] = 0.0
+                                    
+                                    dados_por_mes[mes_ano].append(registro)
+                                    registros_existentes.append(chave_novo_registro)
+                                    novos_registros += 1
+                            
+                            logger.log(f"     - Registros adicionados ao Excel: {novos_registros}", "info")
+                                
+                            # Atualizar contadores
+                            total_transacoes += len(contratos_encontrados)
+                            continue  # Pular para a próxima nota
+                    except Exception as e:
+                        logger.log(f"     - Erro ao extrair contratos futuros: {str(e)}", "erro")
+                    
+                    # Se continuou aqui, não encontrou contratos futuros
                     logger.log(f"     - Alerta: Nenhuma transação encontrada nesta nota", "alerta")
                     
                     # Adicionar dados da nota sem transações no relatório
                     data_referencia = nota.reference_date
-                    mes_ano = data_referencia.strftime('%Y-%m')
+                    mes_ano = data_referencia.strftime('%Y_%m')
                     
                     # Criar uma entrada com informações básicas da nota
                     # Verificar cada atributo antes de acessá-lo para evitar erros
@@ -240,10 +532,42 @@ def processar_arquivo_pdf(caminho_pdf, dados_por_mes, logger):
         
         # Se falhou com correpy, tenta com os analisadores customizados disponíveis
         if (PDF_ANALYZER_DISPONIVEL or ADVANCED_PARSER_DISPONIVEL or EXTRATOR_DIRETO_DISPONIVEL) and not uso_analisador_custom:
-            logger.log(f"  → Tentando processar com analisadores customizados...", "info")
-            resultado_analise = tentar_analisador_customizado(caminho_pdf, logger)
+            logger.log(f"  → Tentando processar com analisadores customizados (modo diagnóstico ativado)...", "info")
+            resultado_analise = tentar_analisador_customizado(caminho_pdf, logger, modo_debug=True)
             
-            if resultado_analise:
+            # Sempre verificar se existem contratos futuros no PDF, independentemente do resultado anterior
+            logger.log("Verificando por contratos futuros diretamente no PDF...", "info")
+            try:
+                # Usar a função importada do módulo extrair_futuros_direto
+                transacoes_futuros = extrair_futuros_main(caminho_pdf)
+                if transacoes_futuros:
+                    logger.log(f"Encontrados {len(transacoes_futuros)} contratos futuros!", "sucesso")
+                    # Se não temos resultado anterior, criar um novo
+                    if not resultado_analise:
+                        resultado_analise = {
+                            "data_nota": datetime.now().strftime("%d/%m/%Y"),
+                            "numero_nota": "AUTO",
+                            "transacoes": transacoes_futuros,
+                            "taxas": {}
+                        }
+                    # Se já temos um resultado mas sem transações, adicionar os contratos
+                    elif not resultado_analise.get("transacoes"):
+                        resultado_analise["transacoes"] = transacoes_futuros
+                    # Se já existem transações, adicionar os contratos como novas transações
+                    else:
+                        # Verificar se já não são as mesmas transações
+                        transa_existentes = resultado_analise.get("transacoes", [])
+                        for contrato in transacoes_futuros:
+                            if not any(t.get('ativo') == contrato.get('ativo') and 
+                                    t.get('quantidade') == contrato.get('quantidade') and 
+                                    t.get('preco') == contrato.get('preco') and
+                                    t.get('tipo') == contrato.get('tipo') for t in transa_existentes):
+                                transa_existentes.append(contrato)
+                        resultado_analise["transacoes"] = transa_existentes
+                        logger.log(f"Total agora: {len(transa_existentes)} transações combinadas", "sucesso")
+            except Exception as e:
+                logger.log(f"Erro ao extrair contratos futuros: {str(e)}", "erro")
+                
                 # Usar os dados do analisador customizado
                 processar_resultado_customizado(resultado_analise, dados_por_mes, logger)
                 total_notas = 1  # Consideramos uma nota bem-sucedida
@@ -253,12 +577,13 @@ def processar_arquivo_pdf(caminho_pdf, dados_por_mes, logger):
         return False, 0, 0
 
 # Função para tentar ler PDF com analisador customizado
-def tentar_analisador_customizado(caminho_pdf, logger):
+def tentar_analisador_customizado(caminho_pdf, logger, modo_debug=True):
     # Primeiro tenta com o extrator direto (maior prioridade)
     if EXTRATOR_DIRETO_DISPONIVEL:
         try:
             logger.log("Tentando extrair informações com o extrator direto...", "info")
-            resultado = extrair_nota_direto(caminho_pdf)
+            # Ativar modo de diagnóstico para obter mais informações
+            resultado = extrair_nota_direto(caminho_pdf, modo_debug=modo_debug)
             
             if resultado and resultado.get("sucesso"):
                 logger.log(f"  → Extrator direto conseguiu extrair dados da nota", "sucesso")
@@ -268,15 +593,41 @@ def tentar_analisador_customizado(caminho_pdf, logger):
                 logger.log(f"     - Corretora: {resultado.get('corretora', 'N/A')}")
                 logger.log(f"     - Transações detectadas: {len(resultado.get('transacoes', []))}")
                 
-                # Listar transações encontradas
-                for i, transacao in enumerate(resultado.get('transacoes', [])):
-                    tipo = transacao.get('tipo', 'N/A')
-                    ativo = transacao.get('ativo', 'N/A')
-                    qtd = transacao.get('quantidade', 0)
-                    preco = transacao.get('preco', 0)
-                    valor_total = transacao.get('valor_total', 0)
-                    tipo_text = 'Compra' if tipo == 'C' else 'Venda' if tipo == 'V' else 'Outro'
-                    logger.log(f"       → Transação #{i+1}: {ativo} - {tipo_text} - {qtd} x {preco} = {valor_total:.2f}")
+                # Verificar transações
+                transacoes = resultado.get('transacoes', [])
+                logger.log(f"        - Total de transações: {len(transacoes)}")
+                
+                # Se não houver transações, tentar extrair contratos futuros diretamente
+                if not transacoes:
+                    logger.log(f"     - Tentando detectar contratos futuros (BMF, WIN, WDO, DOL)...", "alerta")
+                    try:
+                        # Extrair texto do PDF
+                        texto_pdf = extrair_texto_pdf(caminho_pdf)
+                        # Buscar contratos futuros no texto
+                        transacoes_futuros = extrair_contratos_futuros(texto_pdf)
+                        
+                        if transacoes_futuros:
+                            logger.log(f"     - Encontrados {len(transacoes_futuros)} contratos futuros!", "sucesso")
+                            # Adicionar os contratos futuros às transações da nota
+                            transacoes = transacoes_futuros
+                            resultado['transacoes'] = transacoes_futuros
+                        else:
+                            logger.log(f"     - Alerta: Nenhuma transação encontrada nesta nota", "alerta")
+                    except Exception as e:
+                        logger.log(f"     - Erro ao tentar extrair contratos futuros: {str(e)}", "erro")
+                        logger.log(f"     - Alerta: Nenhuma transação encontrada nesta nota", "alerta")
+                
+                # Mostrar transações encontradas (seja pelo parser original ou pela nossa função)
+                if transacoes:
+                    logger.log(f"        - Transações detectadas: {len(transacoes)}")
+                    for j, transacao in enumerate(transacoes):
+                        ativo = transacao.get('ativo', 'N/A')
+                        quantidade = transacao.get('quantidade', 0)
+                        valor_total = transacao.get('valor_total', 0)
+                        tipo = transacao.get('tipo', 'N/A')
+                        tipo_texto = 'Compra' if tipo == 'C' else 'Venda' if tipo == 'V' else 'Outro'
+                        preco = transacao.get('preco', 0)
+                        logger.log(f"          → Transação #{j+1}: {ativo} - {tipo_texto} - {quantidade} x {preco} = {valor_total:.2f}")
                 
                 # Mostrar taxas e valores
                 taxas = resultado.get('taxas', {})
@@ -355,24 +706,134 @@ def tentar_analisador_customizado(caminho_pdf, logger):
         logger.log("Nenhum analisador de PDF está disponível.", "erro")
         return None
 
+# Função para detectar contratos futuros diretamente do PDF
+def detectar_contratos_futuros(caminho_pdf, logger):
+    try:
+        logger.log("Verificando especificamente por contratos futuros (WDO, WIN, DOL, IND)...", "info")
+        
+        # Extrair texto do PDF usando a função importada
+        texto_completo = extrair_texto_pdf(caminho_pdf)
+        
+        transacoes_futuros = []
+        
+        # Lista de símbolos de contratos futuros comuns
+        ativos_futuros = ["WIN", "WDO", "DOL", "IND", "BGI", "CCM", "ICF"]
+        
+        # Verificar linha por linha
+        for linha in texto_completo.split('\n'):
+            linha_upper = linha.upper()
+            
+            # Pular linhas muito pequenas
+            if len(linha.strip()) < 5:
+                continue
+                
+            # Verificar se a linha contém algum dos ativos futuros
+            if any(ativo in linha_upper for ativo in ativos_futuros):
+                logger.log(f"Encontrada linha com contrato futuro: {linha}", "info")
+                
+                # Padrões para detectar contratos futuros
+                padroes = [
+                    # C WDO F25 02/01/2025 1 6.088,0000 DAY TRADE
+                    r'([CV])\s+([A-Z]{3})\s+([A-Z]\d{2}).*?(\d+)\s+([\d.,]+)',
+                    # Padrão mais genérico para capturar mais casos
+                    r'([CV])\s+([A-Z]{3}).*?(\d+).*?([\d.,]+)'
+                ]
+                
+                for padrao in padroes:
+                    match = re.search(padrao, linha, re.IGNORECASE)
+                    if match:
+                        grupos = match.groups()
+                        try:
+                            tipo = "C" if grupos[0].upper() == "C" else "V"
+                            ativo_base = grupos[1].upper()  # WDO, WIN, DOL, etc.
+                            
+                            # Extrair vencimento se disponível
+                            if len(grupos) > 2 and re.match(r'[A-Z]\d{2}', grupos[2]):
+                                vencimento = grupos[2].upper()
+                                quantidade = int(re.sub(r'[^\d]', '', grupos[3]))
+                                preco_str = re.sub(r'[^\d.,]', '', grupos[4])
+                                preco = float(preco_str.replace('.', '').replace(',', '.'))                            
+                            else:
+                                # Para o padrão mais genérico
+                                quantidade = int(re.sub(r'[^\d]', '', grupos[2]))
+                                preco_str = re.sub(r'[^\d.,]', '', grupos[3])
+                                preco = float(preco_str.replace('.', '').replace(',', '.'))
+                                vencimento = ""
+                                # Tentar extrair vencimento do contexto
+                                for termo in linha.split():
+                                    if re.match(r'[A-Z]\d{2}', termo):
+                                        vencimento = termo
+                                        break
+                            
+                            # Formar nome do ativo
+                            ativo = f"{ativo_base} {vencimento}" if vencimento else ativo_base
+                            
+                            # Calcular valor total
+                            valor_total = quantidade * preco
+                            
+                            # Criar transação
+                            transacao = {
+                                "tipo": tipo,
+                                "ativo": ativo.strip(),
+                                "quantidade": quantidade,
+                                "preco": preco,
+                                "valor_total": valor_total
+                            }
+                            
+                            # Adicionar à lista se não for duplicata
+                            if not any(t.get('ativo') == transacao.get('ativo') and 
+                                    t.get('quantidade') == transacao.get('quantidade') and
+                                    t.get('preco') == transacao.get('preco') and
+                                    t.get('tipo') == transacao.get('tipo') for t in transacoes_futuros):
+                                transacoes_futuros.append(transacao)
+                                logger.log(f"Contrato futuro detectado: {tipo} {ativo} - {quantidade} x {preco} = {valor_total:.2f}", "sucesso")
+                        except Exception as e:
+                            logger.log(f"Erro ao processar contrato futuro: {e}", "erro")
+        
+        logger.log(f"Total de contratos futuros detectados: {len(transacoes_futuros)}", "info")
+        return transacoes_futuros
+    except Exception as e:
+        logger.log(f"Erro ao detectar contratos futuros: {e}", "erro")
+        return []
+
 # Função para processar resultado do analisador customizado
 def processar_resultado_customizado(resultado, dados_por_mes, logger):
+    """Processa o resultado do analisador customizado"""
+    if not resultado:
+        return False
+    
     try:
-        # Preparar dados básicos
-        numero_nota = resultado.get('numero_nota', 'N/A')
-        data_nota = resultado.get('data_nota')
-        if isinstance(data_nota, str):
+        # Extrair data
+        data_nota = resultado.get("data_nota")
+        if data_nota:
             try:
-                data_nota = datetime.strptime(data_nota, "%Y-%m-%d").date()
-            except:
-                try:
-                    data_nota = datetime.strptime(data_nota, "%d/%m/%Y").date()
-                except:
-                    data_nota = datetime.now().date()
-        elif not data_nota:
-            data_nota = datetime.now().date()
+                if isinstance(data_nota, str):
+                    # Se for string, tentar converter para data
+                    # Verificar formato da data e converter
+                    if "/" in data_nota:
+                        dia, mes, ano = data_nota.split("/")
+                        data = datetime(int(ano), int(mes), int(dia))
+                    else:
+                        data = datetime.strptime(data_nota, "%Y-%m-%d")
+                else:
+                    # Assumir que já é um objeto date/datetime
+                    data = data_nota
+                    
+                mes_ano = data.strftime("%Y_%m")
+            except Exception as e:
+                logger.log(f"Erro ao processar data da nota: {e}", "erro")
+                mes_ano = "sem_data"
+                data = datetime.now()
+        else:
+            mes_ano = "sem_data"
+            data = datetime.now()
             
-        mes_ano = data_nota.strftime('%Y-%m')
+        # Garantir que o mês existe no dicionário
+        if mes_ano not in dados_por_mes:
+            dados_por_mes[mes_ano] = []
+            
+        # Número da nota
+        numero_nota = resultado.get("numero_nota", "N/A")
         
         # Processar transações
         transacoes = resultado.get('transacoes', [])
@@ -387,10 +848,26 @@ def processar_resultado_customizado(resultado, dados_por_mes, logger):
                     # Converter para formato com decimal (dividindo por 100)
                     transacao['preco'] = preco / 100
         
+        # Define campos comuns de taxas
+        campos_taxas = {
+            'taxa_liquidacao': 'Taxa de Liquidação',
+            'taxa_registro': 'Taxa de Registro',
+            'taxa_termo': 'Taxa de Termo/Opções',
+            'taxa_ana': 'Taxa A.N.A',
+            'emolumentos': 'Emolumentos',
+            'taxa_operacional': 'Taxa Operacional',
+            'execucao': 'Execução',
+            'corretagem': 'Corretagem',
+            'iss': 'ISS',
+            'irrf': 'IRRF Retido na Fonte',
+            'outras_taxas': 'Outros'
+        }
+
+        # Caso onde não há transações
         if not transacoes:
             # Se não há transações, criar entrada apenas com as taxas
             registro = {
-                'Data': data_nota,
+                'Data': data,
                 'Número da Nota': numero_nota,
                 'Tipo de Transação': 'SEM TRANSAÇÕES',
                 'Quantidade': 0,
@@ -399,20 +876,6 @@ def processar_resultado_customizado(resultado, dados_por_mes, logger):
             }
             
             # Adicionar taxas
-            campos_taxas = {
-                'taxa_liquidacao': 'Taxa de Liquidação',
-                'taxa_registro': 'Taxa de Registro',
-                'taxa_termo': 'Taxa de Termo/Opções',
-                'taxa_ana': 'Taxa A.N.A',
-                'emolumentos': 'Emolumentos',
-                'taxa_operacional': 'Taxa Operacional',
-                'execucao': 'Execução',
-                'corretagem': 'Corretagem',
-                'iss': 'ISS',
-                'irrf': 'IRRF Retido na Fonte',
-                'outras_taxas': 'Outros'
-            }
-            
             for campo_origem, campo_destino in campos_taxas.items():
                 registro[campo_destino] = float(taxas.get(campo_origem, 0.0))
                 
@@ -422,6 +885,7 @@ def processar_resultado_customizado(resultado, dados_por_mes, logger):
                     registro[campo] = 0.0
                     
             dados_por_mes[mes_ano].append(registro)
+        # Caso onde há transações
         else:
             # Processar cada transação encontrada
             for transacao in transacoes:
@@ -922,12 +1386,12 @@ root.configure(bg=CORES["bg_escuro"])
 style = themes.ThemedStyle(root)
 style.set_theme("equilux")  # Tema base escuro
 
-# Personalizar estilos dos widgets para uma aparência mais moderna
+# Personalizar estilos dos widgets para uma aparência mais moderna e elegante
 style.configure("TFrame", background=CORES["bg_escuro"])
 style.configure("Card.TFrame", background=CORES["bg_medio"], relief="flat", borderwidth=0, padding=15)
 style.configure("TLabel", background=CORES["bg_escuro"], foreground=CORES["texto"], font=("Segoe UI", 10))
 style.configure("Header.TLabel", font=("Segoe UI", 13, "bold"), foreground=CORES["destaque"])
-style.configure("Title.TLabel", font=("Segoe UI", 18, "bold"), foreground=CORES["destaque"])
+style.configure("Title.TLabel", font=("Segoe UI", 20, "bold"), foreground=CORES["destaque"])
 style.configure("Subtitle.TLabel", font=("Segoe UI", 11), foreground=CORES["alerta"])
 style.configure("Status.TLabel", font=("Segoe UI", 9), foreground=CORES["texto"])
 
@@ -965,15 +1429,16 @@ logo_container.pack(fill=tk.X, pady=(0, 5))
 # Logo e título com ícone moderno
 titulo_label = ttk.Label(
     logo_container, 
-    text="📊 Correpy Plus 2.0", 
-    style="Title.TLabel"
+    text="📊 Correpy Plus", 
+    style="Title.TLabel",
+    font=("Segoe UI", 22, "bold")
 )
 titulo_label.pack(side=tk.LEFT, padx=10)
 
 # Versão
 versao_label = ttk.Label(
     logo_container,
-    text="v2.0",
+    text="v1.0",
     style="Subtitle.TLabel"
 )
 versao_label.pack(side=tk.LEFT, padx=(0, 10))
@@ -987,16 +1452,25 @@ data_label = ttk.Label(
 )
 data_label.pack(side=tk.RIGHT, padx=10)
 
-# Subtitulo descritivo
+# Subtítulo descritivo com visual aprimorado
 subtitulo_container = ttk.Frame(frame_header, style="Card.TFrame")
 subtitulo_container.pack(fill=tk.X, pady=5)
 
 subtitulo_label = ttk.Label(
     subtitulo_container,
     text="Extrator avançado de dados de notas de corretagem para Excel",
-    style="Subtitle.TLabel"
+    style="Subtitle.TLabel",
+    font=("Segoe UI", 11, "italic")
 )
 subtitulo_label.pack(side=tk.LEFT, padx=10)
+
+# Adiciona informação de recursos especiais
+ttk.Label(
+    subtitulo_container,
+    text="✨ Suporte completo para mercado futuro",
+    style="Status.TLabel",
+    foreground=CORES["destaque"]
+).pack(side=tk.RIGHT, padx=10)
 
 # Layout principal reorganizado para design moderno
 main_container = ttk.Frame(root, style="TFrame")
@@ -1186,11 +1660,11 @@ log_handler.log("Selecione a pasta contendo as notas de corretagem em PDF e o ar
 log_handler.log("Clique em 'Processar Notas' para iniciar a conversão.")
 
 # Barra de status na parte inferior
-frame_status = ttk.Frame(root, style="TFrame")
+frame_status = ttk.Frame(root, style="Card.TFrame")
 frame_status.pack(fill=tk.X, padx=20, pady=10)
 
-ttk.Label(frame_status, text="Correpy Plus v1.0 | Desenvolvido com ❤️", style="Status.TLabel").pack(side=tk.LEFT)
-ttk.Label(frame_status, text="Baseado em https://github.com/thiagosalvatore/correpy", style="Status.TLabel").pack(side=tk.RIGHT)
+ttk.Label(frame_status, text="📊 Correpy Plus v1.0 | Desenvolvido com ❤️", style="Status.TLabel", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=10, pady=5)
+ttk.Label(frame_status, text="© 2025 | github.com/thiagosalvatore/correpy", style="Status.TLabel").pack(side=tk.RIGHT, padx=10, pady=5)
 
 # Iniciar loop de eventos
 root.mainloop()
